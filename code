@@ -1,0 +1,722 @@
+## import data ##
+library(tidyverse)
+card<-read_csv("card_transdata.csv",na=c(".", "NA", "", "?"))
+
+## data cleaning and define measure levels ##
+card <- card %>% 
+  mutate(across(c(repeat_retailer,used_chip,used_pin_number,online_order,fraud), as.factor))
+
+#########################
+### Data Exploration ###
+########################
+
+## summary statistics ##
+# detailed summary statistics
+
+library(fBasics)
+card %>% select_if(is.numeric) %>%  basicStats
+card %>% select_if(is.numeric) %>%  skewness(na.rm=TRUE)
+card %>% select_if(is.numeric) %>%  kurtosis(na.rm=TRUE)
+
+## distribution plots ##
+# histogram
+par(mfrow=c(1,3))
+ggplot(card, aes(distance_from_home)) + geom_histogram(bins=1000)+xlim(0,500)
+ggplot(card, aes(distance_from_last_transaction)) + geom_histogram(bins=1000)+xlim(0,100)
+ggplot(card, aes(ratio_to_median_purchase_price)) + geom_histogram(bins=1000)+xlim(0,50)
+par(mfrow=c(1,1))
+
+#bar chart
+par(mfrow=c(2,2))
+ggplot(card,aes(repeat_retailer))+
+  geom_bar()
+ggplot(card,aes(used_chip))+
+  geom_bar()
+ggplot(card,aes(used_pin_number))+
+  geom_bar()
+ggplot(card,aes(online_order))+
+  geom_bar()
+ggplot(card,aes(fraud))+
+  geom_bar()
+par(mfrow=c(1,1))
+
+## Imbalanced data barchart
+ggplot(card, aes(fraud)) + geom_bar()+ xlab("Fraud") +
+  geom_text(aes(label = ..count..), stat = "count", vjust = 1.5, colour = "green")
+
+#################################
+## Variable Importance Measure ##
+#################################
+
+## Binary Target ##
+
+# nominal input - chi-square
+card %>% 
+  summarise(across(where(is.factor), ~ chisq.test(.,fraud)$p.value)) %>% 
+  sort
+# The p-value of four catagorical variables are 0,0,0 and 0.176 respectively when they do chisquare test 
+# with fraud, so we drop repeat_retailer.
+
+# numeric input - t stat
+card %>% 
+  summarise(across(where(is.numeric), ~ t.test(.~fraud)$p.value)) %>%
+  sort
+# The p-value of three numeric variables are 0,0 and 0 respectively when do t.test with fraud, so we keep all
+# numeric variables as input variables.
+
+# numeric input - area under ROC curve for predicting target
+library(caret)
+card %>% 
+  select(fraud, where(is.numeric)) %>%  
+  filterVarImp(.$fraud) %>%  
+  arrange(desc(X1)) 
+# Based on ROC index, there is no apparent evidence that which is more important than others.
+
+#################################
+## transforamtion ##
+#################################
+# Box-Cox Transformation on numeric inputs
+
+library(caret)
+TransformParams <- card %>% 
+  as.data.frame %>%   # preProcess works better with dataframe than tibble
+  select(1:3) %>% 
+  preProcess(method=c("BoxCox"))
+TransformParams$bc
+
+card.xf <- card %>%  
+  as.data.frame %>%  
+  predict(TransformParams,.) %>% 
+  as_tibble
+
+# Histograms before/after transformation
+par(mfrow=c(3,2))
+hist(card$distance_from_home)
+hist(card.xf$distance_from_home)
+hist(card$distance_from_last_transaction)
+hist(card.xf$distance_from_last_transaction)
+hist(card$ratio_to_median_purchase_price)
+hist(card.xf$ratio_to_median_purchase_price)
+par(mfrow=c(1,1))
+
+# hitograms and dot plots from dataframe
+library(Hmisc)
+hist.data.frame(card)
+###############################
+## missing values exploration ##
+##################################
+library(Amelia)
+missmap(card, main="Missing Map")
+
+
+
+## Partitioning ##
+library(caTools)
+set.seed(1234)
+split = sample.split(card$fraud, SplitRatio = 0.5)
+
+####################################
+######### Decision Tree ############
+####################################
+card.df <- as.data.frame(card)  # for building DM models
+# Model building
+
+library(rpart)
+tree1 <- rpart(fraud ~ ., data=card.df[split,],control=rpart.control(cp=0.001))
+summary(tree1)
+
+# Model pruning on F-score USING alternative cutoff
+library(pROC)
+library(caret)
+cp.seq = tree1$cptable[,1]
+fscore <- numeric()
+fscore[1]<-0  # Set root node F-score zero
+for (i in 2:length(cp.seq)) {
+  tree1.prob = predict(prune(tree1, cp=cp.seq[i]), card.df[!split,],type="prob")[,2] 
+  rocCurve.tree <- roc(card.df$fraud[!split], tree1.prob, quiet=TRUE)
+  treeThresh <-  coords(rocCurve.tree, x = "best", best.method = "closest.topleft")
+  tree1.class <- as.factor(ifelse(tree1.prob >= treeThresh$threshold, 1,0))
+  fscore[i]<-confusionMatrix(tree1.class,card.df$fraud[!split],positive = "1")$byClass["F1"]
+}
+
+###plot
+plot(tree1$cptable[,'nsplit']+1,fscore,
+     type="o", xlab="Number of Leaves", ylab="F-score")
+# Final model
+tree1.final=prune(tree1,cp=cp.seq[fscore==max(fscore)])  #max(fscore is 0.999714
+max(fscore)
+tree1.final
+treeThresh
+library(partykit)
+plot(as.party(tree.final))
+# Prediction
+tree1.class<-predict(tree1.final, card.df[!split,], type="class")
+tree1.prob <-predict(tree1.final, card.df[!split,], type = "prob")[,2]
+
+
+#############################
+####### Imputation  #########
+#############################
+
+card.imp<-card.xf
+
+########################################
+######### Logistic Regression ##########
+########################################
+
+card.mdl<-card.imp # pass on data
+
+# summary(card.mdl)
+# summary(card.mdl[split,])
+
+# Build full model
+full1 = glm(fraud ~., family=binomial, 
+           data=card.mdl[split,] )
+summary(full1)
+null1 <- glm(fraud ~1, family=binomial, data=card.mdl[split,])
+n<-sum(split)
+
+# Stepwise selection
+reg.step1 <- step(null1, scope=formula(full1), direction="both", k=log(n))
+reg.step1.prob<-predict(reg.step1,card.mdl[!split,], type = "response") 
+
+# Use alternative cutoff
+rocCurve.step.reg <- roc(card$fraud[!split], reg.step1.prob, quiet = TRUE)
+regThresh.step <-  coords(rocCurve.step.reg, x = "best", best.method = "closest.topleft")
+reg.step1.class <- as.factor(ifelse(reg.step1.prob >= regThresh.step$threshold, 1,0))
+reg.step.fscore1<-confusionMatrix(reg.step1.class,card$fraud[!split],
+                                 positive = "1")$byClass["F1"]
+
+reg.step.fscore1
+
+
+# Forward
+reg.fwd <- step(null, scope=formula(full), direction="forward", k=log(n), trace = FALSE)
+summary(reg.fwd)
+reg.fwd.prob<-predict(reg.fwd,card.mdl[!split,], type = "response")
+
+# Use alternative cutoff
+rocCurve.fwd.reg <- roc(card$fraud[!split], reg.fwd.prob, quiet = TRUE)
+regThresh.fwd <-  coords(rocCurve.fwd.reg, x = "best", best.method = "closest.topleft")
+reg.fwd.class <- as.factor(ifelse(reg.fwd.prob >= regThresh.fwd$threshold, 1,0))
+reg.fwd.fscore<-confusionMatrix(reg.fwd.class,card$fraud[!split],
+                                positive = "1")$byClass["F1"]
+
+reg.fwd.fscore
+
+
+
+# Backward
+reg.bwd <- step(full, direction="backward",k=log(n), trace = FALSE)
+summary(reg.bwd)
+reg.bwd.prob<-predict(reg.bwd,card.mdl[!split,], type = "response")
+
+# Use alternative cutoff
+rocCurve.bwd.reg <- roc(card$fraud[!split], reg.bwd.prob, quiet = TRUE)
+regThresh.bwd <-  coords(rocCurve.bwd.reg, x = "best", best.method = "closest.topleft")
+reg.bwd.class <- as.factor(ifelse(reg.bwd.prob >= regThresh.bwd$threshold, 1,0))
+reg.bwd.fscore<-confusionMatrix(reg.bwd.class,card$fraud[!split],
+                                positive = "1")$byClass["F1"]
+
+reg.bwd.fscore
+
+# confusionMatrix
+confusionMatrix(reg.step1.class,card$fraud[!split],
+                positive = "1", mode= "everything")
+confusionMatrix(reg.fwd.class,card$fraud[!split],
+                positive = "1", mode= "everything")
+
+confusionMatrix(reg.bwd.class,card$fraud[!split],
+                positive = "1", mode= "everything")
+
+
+c(reg.step.fscore1, reg.fwd.fscore, reg.bwd.fscore)
+
+
+
+
+#####################
+####### ANN  ########
+#####################
+
+card.ann<-card.imp
+
+vars.ann<-c("repeat_retailer","used_chip","used_pin_number","online_order","distance_from_home","distance_from_last_transaction","ratio_to_median_purchase_price") # extract variable names from bwd model
+
+
+## Standardization ## 
+library(caret)
+ScaleParams <- preProcess(card.ann[split, vars.ann], method=c("center", "scale"))
+card.ann <- card.ann %>% predict(ScaleParams, .)
+
+## Hot encoding ##
+str(card.ann)
+dummy <- dummyVars( ~ ., data = card.ann[split, c(vars.ann, "fraud")], fullRank = TRUE)
+card.ann.encode<- card.ann %>% predict(dummy, .) 
+
+x.train <- card.ann.encode[split, -ncol(card.ann.encode)] 
+y.train <- card.ann.encode[split,"fraud.1"]
+x.valid <- card.ann.encode[!split, -ncol(card.ann.encode)] 
+y.valid <- card.ann.encode[!split,"fraud.1"]
+
+
+
+library(tensorflow)
+library(keras)
+
+set_random_seed(42)
+
+
+ann <- keras_model_sequential() %>% 
+  layer_dense(units = 4, activation = "tanh", input_shape = c(7)) %>% 
+  layer_dense(units = 1, activation = "sigmoid")
+
+
+
+ann %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = c("accuracy")
+)
+
+callbacks.list = list(
+  callback_early_stopping(
+    monitor = "val_loss", # change
+    patience = 5
+  ),
+  callback_model_checkpoint(
+    filepath="card_ann.h5",
+    monitor = "val_loss",  # change
+    save_best_only = TRUE
+  )
+)
+
+history <- ann %>% fit(
+  x= x.train,
+  y= y.train,
+  epochs = 40,
+  validation_data = list(x.valid,y.valid),
+  verbose = 1,
+  callbacks = callbacks.list
+)
+
+ann.select1<- load_model_hdf5("card_ann.h5")
+
+## Prediction ##
+ann1.prob<-ann.select1 %>% predict(x.valid)
+
+
+# Use alternative cutoff
+
+rocCurve.ann <- roc(card$fraud[!split], as.vector(ann1.prob), quiet=TRUE)
+annThresh <-  coords(rocCurve.ann, x = "best", best.method = "closest.topleft")
+ann1.class <- as.factor(ifelse(ann1.prob >= annThresh$threshold, 1,0))
+ann.fscore1<-confusionMatrix(ann1.class,card$fraud[!split],
+                            positive = "1")$byClass["F1"]
+
+ann.fscore1  #
+
+confusionMatrix(ann1.class,card$fraud[!split],
+                positive = "1", mode= "everything")
+
+
+
+#################################################################
+####################    With Under-Sampling   ###################
+#################################################################
+
+## add ID index##
+card<-card %>% mutate(ID=row_number())
+card <- card %>% 
+  mutate(across(c(ID,fraud), as.factor))
+card
+
+## Under-Sampling ##
+
+set.seed(1234)
+downSampledTrain <- downSample(x = card[split,] %>% select(-fraud),
+                               y = card$fraud[split],
+                               yname = "fraud")
+
+summary(downSampledTrain)
+
+## Combine downsampled train with validation ##
+card.down <- card %>% filter(ID %in% downSampledTrain$ID | !split)
+
+# Indicator for balanced train data #
+split.down<-ifelse(card.down$ID %in% downSampledTrain$ID, TRUE, FALSE)
+
+# Prep for building DM models
+card.down <- as.data.frame(card.down)  
+row.names(card.down) <- card.down$ID
+card.down <- card.down %>% select(-9) 
+
+###############################
+####### Decision Tree #########
+###############################
+
+
+tree<- rpart(formula = fraud ~ .,data = card.down[split.down,],
+             control=rpart.control(cp=0.001))
+summary(tree)
+
+library(partykit)
+plot(as.party(tree))
+print(tree)
+
+cp.seq=tree$cptable[,1]
+fscore.seq<-numeric()
+fscore.seq[1]<-0 
+for (i in 2:length(cp.seq)) {
+  tree.prob.seq = predict(prune(tree, cp=cp.seq[i]), card.down[!split.down,],type="prob")[,2]
+  tree.class.seq <- as.factor(ifelse(tree.prob.seq >= 0.5, 1,0))
+  fscore.seq[i]<-confusionMatrix(tree.class.seq,card.down$fraud[!split.down],
+                                 positive = "1")$byClass["F1"]}
+
+plot(tree$cptable[,'nsplit']+1,fscore.seq,
+     type="o", xlab="Number of Leaves", ylab="F Score")
+
+tree.final=prune(tree,cp=cp.seq[fscore.seq==max(fscore.seq)])
+plot(as.party(tree.final))
+max(fscore.seq)
+## Prediction ##
+tree.class<-predict(tree.final, card.down[!split.down,], type="class")
+tree.prob <-predict(tree.final, card.down[!split.down,], type = "prob")[,2]
+
+
+
+#################################
+####### Transformation  #########
+#################################
+
+# Box-Cox Transformation on numeric inputs
+
+card.down.xf <- card.down 
+
+# numeric input xform
+card.down.xf <- card.down.xf %>% 
+  mutate(across(c(distance_from_home, distance_from_last_transaction, ratio_to_median_purchase_price), ~ log(.)))
+
+
+#####################################
+####### Logistic Regression #########
+#####################################
+
+card.down.mdl<-card.down.xf
+
+full = glm(fraud ~ ., family=binomial, data=card.down.mdl[split.down,])
+
+null<-glm(fraud ~ 1, family=binomial, data=card.down.mdl[split.down,])
+n<-sum(split)
+
+# Stepwise selection
+reg.step <- step(null, scope=formula(full), direction="both", k=log(n), trace = FALSE)
+summary(reg.step)
+
+## Prediction ##
+reg.step.prob<-predict(reg.step,card.down.mdl[!split.down,], type = "response") 
+reg.step.class <- ifelse(reg.step.prob > 0.5, 1, 0)
+
+
+
+#####################
+####### ANN  ########
+#####################
+
+card.down.ann<-card.down.xf
+vars.ann.down<-attr(terms(reg.step), "term.labels")   # extract variable names from stepwise model
+
+
+## Standardization ## 
+ScaleParams.down <- preProcess(card.down.ann[split.down, vars.ann.down], method=c("center", "scale"))
+card.down.ann <- card.down.ann %>% predict(ScaleParams.down, .)
+
+## Hot encoding ##
+dummy.down <- dummyVars( ~ ., data = card.down.ann[split.down, c(vars.ann.down, "fraud")], fullRank = TRUE)
+card.down.ann.encode<- card.down.ann %>% predict(dummy.down, .) 
+
+x.train.down <- card.down.ann.encode[split.down, -ncol(card.down.ann.encode)] 
+y.train.down <- card.down.ann.encode[split.down,"fraud.1"]
+x.valid.down <- card.down.ann.encode[!split.down, -ncol(card.down.ann.encode)] 
+y.valid.down <- card.down.ann.encode[!split.down,"fraud.1"]
+
+
+library(tensorflow)
+library(keras)
+
+set_random_seed(24)
+
+
+ann.down <- keras_model_sequential() %>% 
+  layer_dense(units = 6, activation = "tanh", input_shape = c(7)) %>% 
+  layer_dense(units = 6, activation = "tanh") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+
+ann.down %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = "adam",
+  metrics = c("accuracy")
+)
+
+callbacks.list = list(
+  callback_early_stopping(monitor = "val_accuracy", 
+                          patience = 5),
+  callback_model_checkpoint(filepath="my_ann_project.h5", 
+                            monitor = "val_accuracy", 
+                            save_best_only = TRUE, 
+  ))
+
+
+history <- ann.down %>% fit(
+  x= x.train.down,
+  y= y.train.down,
+  epochs = 40,
+  validation_data = list(x.valid.down,y.valid.down),
+  verbose = 1,
+  callbacks = callbacks.list
+)
+
+
+ann.select<- load_model_hdf5("my_ann_project.h5") 
+summary(ann.select)
+
+
+
+## Prediction ##
+ann.prob<-ann.select %>% predict(x.valid.down) 
+ann.class <-ifelse(ann.prob > 0.5, 1, 0)
+
+
+
+### Confusion Matrix ###
+library(gmodels)
+table(ann.class, y.valid.down)
+
+CrossTable(ann.class, y.valid.down)
+
+### Evaluations related to Confusion Matrix ###
+tree.class <- as.factor(tree.class)
+confusionMatrix(data = tree.class, 
+                reference = card.down$fraud[!split.down],
+                positive = "1",      
+                mode= "everything")$byClass["F1"]
+
+reg.step.class <- as.factor(reg.step.class)
+confusionMatrix(data = reg.step.class, 
+                reference = card.down$fraud[!split.down],
+                positive = "1",      
+                mode= "everything")$byClass["F1"]
+
+ann.class <- as.factor(ann.class)
+confusionMatrix(data = ann.class, 
+                reference = card.down$fraud [!split.down],
+                positive = "1",      
+                mode= "everything")$byClass["F1"]
+
+
+###########################################
+########  Random Forest ###################
+###########################################
+
+#################################################################
+####################    With Under-Sampling   ###################
+#################################################################
+
+#######################
+#### Random Forest ####
+#######################
+
+card.rf <- card.down
+
+
+library(randomForest)
+set.seed(1234)
+RF <- randomForest(fraud ~., data=card.rf[split.down,],
+                   ntree = 1000,
+                   importance = TRUE)
+
+print(RF)
+plot(RF)  # OOB error is OOB MISC (in black)
+
+
+# Make predictions #
+RF.class<- predict(RF, card.rf[!split.down,], type="response")
+fscore.rf<-confusionMatrix(RF.class,card.rf$fraud[!split.down],
+                        positive = "1")$byClass["F1"]  
+fscore.rf #0.9997369
+
+# Variable importance #
+RF$importance
+varImpPlot(RF)  
+
+
+#### Parameter Tuning: mtry ####
+
+# m<-round(seq(from=2, to=28, length.out = 5))
+m<-seq(2,7)
+fscore.seq.rf<-numeric()
+
+for(i in 1:length(m)){ 
+  set.seed(1234)
+  rf <- randomForest(fraud ~., data=card.rf[split.down,],
+                     ntree=50, mtry=m[i])
+  
+  rf.class<- predict(rf, newdata=card.rf[!split.down,], type="response")
+  fscore.seq.rf[i]<-confusionMatrix(rf.class,card.rf$fraud[!split.down],
+                                 positive = "1")$byClass["F1"]
+}
+
+plot(m, fscore.seq.rf, pch=19 , col="blue", type="b",
+     ylab="F-score",xlab="Number of Predictors considered at each split")
+
+
+m.best<- m[which.max(fscore.seq.rf)]
+max(fscore.seq.rf) #0.9997026
+
+# assign m.best to mtry in the above RF 
+# and then pick appropriate ntree
+
+set.seed(1234)
+RF.final <- randomForest(fraud ~., data=card.rf[split.down,],
+                         ntree = 50,
+                         importance = TRUE,
+                         mtry=m.best)
+
+print(RF.final)
+plot(RF.final)  # OOB error is OOB MISC (in black)
+
+
+# Make predictions #
+RF.final.class <- predict(RF.final, card.rf[!split.down,], type="response")
+RF.final.prob <- predict(RF.final, card.rf[!split.down,], type = "prob")[,2]
+
+fscore.rf.final<-confusionMatrix(RF.final.class,card.rf$fraud[!split.down],
+                                 positive = "1")$byClass["F1"]  
+fscore.rf.final #0.999714
+
+# Variable importance #
+RF.final$importance
+varImpPlot(RF.final)
+
+
+
+#######################################################################
+#######################    Without Under-Sampling   ###################
+#######################################################################
+
+
+#######################
+#### Random Forest ####
+#######################
+
+card.rf.without <- card
+
+minor <- unname(summary(card.rf.without$fraud[split])[2])
+
+library(randomForest)
+set.seed(1234)
+RF1 <- randomForest(fraud ~., data=card.rf.without[split,] %>% select(-ID),
+                   ntree = 100, 
+                   strata= card.rf.without$fraud[split], 
+                   sampsize=c(minor,minor),
+                   importance =TRUE)
+print(RF1)
+plot(RF1)  
+
+
+
+# Make predictions #
+RF1.class<- predict(RF1, newdata=card.rf.without[!split,], type="response")
+RF1.prob <- predict(RF1, card.rf.without[!split,], type = "prob")[,2]
+fscore.rf<-confusionMatrix(RF1.class, card.rf.without$fraud[!split],
+                        positive = "1")$byClass["F1"]  
+fscore.rf
+
+
+# Variable importance #
+RF1$importance
+varImpPlot(RF1)  
+
+
+
+### Profit Matrix ###
+card.p <- fct_rev(card$fraud)
+
+
+# Define profit matrix
+profitMatrix<- matrix(c(11.11,0,0,1.09), nrow=2)
+rownames(profitMatrix) <- levels(card.p)
+colnames(profitMatrix) <- levels(card.p)
+profitMatrix
+
+
+# Function: calculate model average profit
+avgprofit<- function(pmatrix, prob, target){ 
+  # pmatrix: profit matrix
+  #    prob: predicted prob.
+  # target:  actual target, assuming 2nd level 
+  #          is of primary interest
+  
+  N <- pmatrix[2,2]-pmatrix[2,1] 
+  D <- N - (pmatrix[1,2]-pmatrix[1,1]) 
+  threshold.p <- N/D
+  pclass<-as.factor(ifelse(prob >= threshold.p, 1, 0))
+  pclass <- fct_rev(pclass)
+  target <- fct_rev(target)
+  cm <- table(target,pclass)
+  profit <- sum(pmatrix*cm)/sum(cm) 
+  profit
+}
+
+
+# Reg
+reg1.profit <- avgprofit(profitMatrix, reg.step1.prob, card$fraud[!split]) #
+
+# DT
+tree1.profit <- avgprofit(profitMatrix, tree1.prob, card$fraud[!split])    #
+
+# ANN
+ann1.profit <- avgprofit(profitMatrix, ann1.prob, card$fraud[!split]) #
+
+# RF
+RF1.profit <- avgprofit(profitMatrix, RF1.prob, card$fraud[!split])
+# Compare average profits
+c(tree1.profit, reg1.profit, ann1.profit,RF1.profit)  #1.964440, 1.698411, 1.946323, 1.901713
+
+
+### Evaluations related to ROC curves ###
+rocCurve.ann<- roc(response = card$fraud[!split], 
+                   predictor = as.vector(ann1.prob),
+                   levels = levels(card$fraud[!split]))  
+
+
+# DT
+rocCurve.tree <- roc(card$fraud[!split], tree1.prob)
+
+# Reg
+rocCurve.reg<- roc(card$fraud[!split], reg.step1.prob)
+
+# RF
+rocCurve.rf<- roc(card$fraud[!split], RF1.prob)
+
+
+## Plot ROC Curves
+plot(rocCurve.tree, legacy.axes = TRUE, col= 'blue')
+plot.roc(rocCurve.reg, add=TRUE, legacy.axes = TRUE, col= 'red')
+plot.roc(rocCurve.ann, add=TRUE, legacy.axes = TRUE, col= 'green')
+plot.roc(rocCurve.rf, add=TRUE, legacy.axes = TRUE, col= 'black')
+legend('topright', legend=c('valid.ann', 'valid.reg', 'valid.tree', 'valid.rf'), 
+       col=c("green","red","blue","black"),lty=c(1,1,1,1))
+
+
+
+
+
+
+
+
+
+
+
+
